@@ -1,0 +1,842 @@
+!pip install --upgrade owlready2 pgmpy rapidfuzz xgboost scikit-learn
+!pip uninstall -y pgmpy
+!pip install pgmpy==0.1.20
+!pip install scikit-learn==1.5.2 imbalanced-learn==0.12.3
+
+
+import os
+import re
+import warnings
+from collections import defaultdict
+from itertools import product, combinations
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+from rapidfuzz import process, fuzz
+from imblearn.over_sampling import ADASYN
+
+# ML / Eval
+from sklearn.model_selection import (
+    learning_curve, RepeatedKFold, cross_val_score, train_test_split,
+    RandomizedSearchCV, StratifiedKFold
+)
+from sklearn.ensemble import RandomForestRegressor, StackingRegressor
+from sklearn.linear_model import LinearRegression, Ridge
+from sklearn.metrics import mean_absolute_error, mean_squared_error, make_scorer
+from sklearn.preprocessing import LabelEncoder, OneHotEncoder
+from sklearn.impute import SimpleImputer
+
+# Bayesian / Probabilistic reasoning
+import pgmpy
+import pgmpy.estimators as est
+from pgmpy.estimators import HillClimbSearch, BDeuScore, BayesianEstimator
+from pgmpy.models import BayesianNetwork
+from pgmpy.inference import VariableElimination
+
+# Modello XGBoost per Regressione
+from xgboost import XGBRegressor
+
+warnings.filterwarnings("ignore")
+
+print("pgmpy version:", pgmpy.__version__)
+print("BDeuScore OK")
+
+
+PATH_RATINGS = "/kaggle/input/prova1/Netflix TV Shows and Movies.csv"
+PATH_INFO = "/kaggle/input/prova1/netflix_titles.csv"
+
+# -------------------------
+# 2) Load datasets
+# -------------------------
+df_ratings = pd.read_csv(PATH_RATINGS)
+df_info = pd.read_csv(PATH_INFO)
+
+print("Ratings shape:", df_ratings.shape)
+print("Info shape:", df_info.shape)
+
+# Visual quick peek
+display(df_ratings.head(2))
+display(df_info.head(2))
+
+# -------------------------
+# 3) Standardize titles & years for merging
+# -------------------------
+def normalize_title(t):
+    if pd.isna(t):
+        return ""
+    s = str(t).strip().lower()
+    s = re.sub(r'[^0-9a-z\s]', '', s)
+    s = re.sub(r'\s+', ' ', s)
+    return s
+
+# create normalized columns
+df_ratings['title_norm'] = df_ratings['title'].apply(normalize_title)
+if 'release_year' in df_ratings.columns:
+    df_ratings['year'] = df_ratings['release_year'].astype('Int64')
+else:
+    df_ratings['year'] = df_ratings.get('release_year', pd.NA).astype('Int64')
+
+df_info['title_norm'] = df_info['title'].apply(normalize_title)
+if 'release_year' in df_info.columns:
+    df_info['year'] = df_info['release_year'].astype('Int64')
+else:
+    df_info['year'] = df_info.get('release_year', pd.NA).astype('Int64')
+
+# -------------------------
+# 4) Exact merge on normalized title + year
+# -------------------------
+merged = pd.merge(df_info, df_ratings,
+                  left_on=['title_norm','year'],
+                  right_on=['title_norm','year'],
+                  how='inner',
+                  suffixes=('_info','_ratings'))
+
+print("Merged exact:", merged.shape)
+
+if merged.shape[0] < 2000:
+    print("Exact merge small, attempting fuzzy merge on title (within same year)...")
+    merged_rows = []
+    for y, grp in df_info.groupby('year'):
+        choices = df_ratings[df_ratings['year'] == y]['title_norm'].unique().tolist()
+        if len(choices) == 0:
+            continue
+        for idx, row in grp.iterrows():
+            t = row['title_norm']
+            match, score, match_idx = process.extractOne(t, choices, scorer=fuzz.QRatio)
+            if score >= 90:
+                matched_rows = df_ratings[(df_ratings['title_norm'] == match) & (df_ratings['year'] == y)]
+                for _, rrow in matched_rows.iterrows():
+                    combined = {**row.to_dict(), **rrow.to_dict()}
+                    merged_rows.append(combined)
+    if len(merged_rows) > 0:
+        merged = pd.DataFrame(merged_rows)
+    print("Merged fuzzy:", merged.shape)
+
+cols_keep = [
+    'title_info','title_ratings','year',
+    'director','cast','listed_in','description_info',
+    'imdb_score','imdb_votes','duration'
+]
+available = [c for c in cols_keep if c in merged.columns]
+merged = merged[available].copy()
+
+if 'title_info' in merged.columns:
+    merged.rename(columns={'title_info':'title'}, inplace=True)
+elif 'title_ratings' in merged.columns:
+    merged.rename(columns={'title_ratings':'title'}, inplace=True)
+
+print("Final merged columns:", merged.shape)
+display(merged.head(3))
+
+# -------------------------
+# 5) Preprocessing: clean cast/director, explode actors
+# -------------------------
+def split_people(cell):
+    if pd.isna(cell):
+        return []
+    parts = [p.strip() for p in str(cell).split(",") if p.strip() != ""]
+    return parts
+
+merged['directors_list'] = merged['director'].apply(split_people)
+merged['actors_list'] = merged['cast'].apply(split_people)
+
+exploded_actors = merged.explode('actors_list').dropna(subset=['actors_list']).copy()
+exploded_actors.rename(columns={'actors_list':'actor'}, inplace=True)
+
+exploded_dirs = merged.explode('directors_list').dropna(subset=['directors_list']).copy()
+exploded_dirs.rename(columns={'directors_list':'director_single'}, inplace=True)
+
+actor_stats = exploded_actors.groupby('actor').agg(
+    actor_count=('imdb_score','count'),
+    actor_mean=('imdb_score','mean')
+).reset_index()
+director_stats = exploded_dirs.groupby('director_single').agg(
+    dir_count=('imdb_score','count'),
+    dir_mean=('imdb_score','mean')
+).reset_index()
+
+MIN_OCC = 3
+actor_stats = actor_stats[actor_stats['actor_count'] >= MIN_OCC].reset_index(drop=True)
+director_stats = director_stats[director_stats['dir_count'] >= MIN_OCC].reset_index(drop=True)
+
+print("Unique actors (freq >= {}):".format(MIN_OCC), actor_stats.shape[0])
+print("Unique directors (freq >= {}):".format(MIN_OCC), director_stats.shape[0])
+
+pairs = []
+for idx, row in merged.iterrows():
+    directors = row['directors_list']
+    actors = row['actors_list']
+    if not directors or not actors:
+        continue
+    for d in directors:
+        for a in actors:
+            pairs.append((d,a,row['imdb_score']))
+pairs_df = pd.DataFrame(pairs, columns=['director','actor','imdb_score'])
+team_stats = pairs_df.groupby(['director','actor']).agg(
+    pair_count=('imdb_score','count'),
+    pair_mean=('imdb_score','mean')
+).reset_index()
+team_stats = team_stats[team_stats['pair_count'] >= 2]
+print("Team pairs (count>=2):", team_stats.shape[0])
+
+merged['genre_list'] = merged['listed_in'].fillna('').apply(lambda s: [g.strip() for g in s.split(',')] if s else [])
+
+# Esplode il DataFrame sia per attori/registi che per generi
+exploded_genre_actors = merged.explode('actors_list').dropna(subset=['actors_list']).explode('genre_list').dropna(subset=['genre_list']).copy()
+exploded_genre_actors.rename(columns={'actors_list':'actor', 'genre_list':'genre'}, inplace=True)
+
+exploded_genre_directors = merged.explode('directors_list').dropna(subset=['directors_list']).explode('genre_list').dropna(subset=['genre_list']).copy()
+exploded_genre_directors.rename(columns={'directors_list':'director_single', 'genre_list':'genre'}, inplace=True)
+
+# Aggrega per attore e genere
+actor_genre_stats = exploded_genre_actors.groupby(['actor', 'genre']).agg(
+    actor_genre_count=('imdb_score','count'),
+    actor_genre_mean=('imdb_score','mean')
+).reset_index()
+
+# Aggrega per regista e genere
+director_genre_stats = exploded_genre_directors.groupby(['director_single', 'genre']).agg(
+    dir_genre_count=('imdb_score','count'),
+    dir_genre_mean=('imdb_score','mean')
+).reset_index()
+
+MIN_OCC_GENRE = 2
+actor_genre_stats = actor_genre_stats[actor_genre_stats['actor_genre_count'] >= MIN_OCC_GENRE].reset_index(drop=True)
+director_genre_stats = director_genre_stats[director_genre_stats['dir_genre_count'] >= MIN_OCC_GENRE].reset_index(drop=True)
+
+# Creazione di mappe che contengono sia la media che il conteggio
+actor_genre_map = { (row['actor'], row['genre']): (row['actor_genre_mean'], row['actor_genre_count']) for _, row in actor_genre_stats.iterrows() }
+director_genre_map = { (row['director_single'], row['genre']): (row['dir_genre_mean'], row['dir_genre_count']) for _, row in director_genre_stats.iterrows() }
+
+# -------------------------
+# 6) Build minimal OWL KB with Owlready2 and materialize facts
+# -------------------------
+
+# Importazioni locali per garantire che le dipendenze siano caricate
+try:
+    from owlready2 import get_ontology, Thing, DataProperty, ObjectProperty, default_world
+    import networkx as nx
+except ImportError:
+    print("La libreria owlready2 non è installata. Installazione in corso...")
+    !pip install owlready2 networkx
+    from owlready2 import get_ontology, Thing, DataProperty, ObjectProperty, default_world
+    import networkx as nx
+
+# Inizio della creazione dell'ontologia
+onto = get_ontology("http://example.org/movielab.owl")
+
+with onto:
+    class Film(Thing): pass
+    class Person(Thing): pass
+    class Actor(Person): pass
+    class Director(Person): pass
+    class Genre(Thing): pass
+
+    class hasActor(ObjectProperty):
+        domain = [Film]
+        range = [Actor]
+    class hasDirector(ObjectProperty):
+        domain = [Film]
+        range = [Director]
+    class hasGenre(ObjectProperty):
+        domain = [Film]
+        range = [Genre]
+
+    class hasRating(DataProperty):
+        domain = [Film]
+        range = [float]
+        functional = True
+
+    class releaseYear(DataProperty):
+        domain = [Film]
+        range = [int]
+        functional = True
+
+frequent_actors = set(actor_stats['actor'].tolist())
+frequent_directors = set(director_stats['director_single'].tolist())
+
+actor_map = {}
+director_map = {}
+for a in frequent_actors:
+    ind = Actor(a.replace(" ", "_"))
+    actor_map[a] = ind
+for d in frequent_directors:
+    ind = Director(d.replace(" ", "_"))
+    director_map[d] = ind
+
+film_map = {}
+for idx, row in merged.iterrows():
+    title_id = re.sub(r'[^0-9a-zA-Z]+', '_', row['title'])[:80]
+    if title_id in film_map:
+        continue
+    f = Film(title_id)
+    try:
+        f.hasRating = float(row['imdb_score'])
+    except:
+        pass
+    try:
+        f.releaseYear = int(row['year']) if not pd.isna(row['year']) else None
+    except:
+        pass
+
+    for a in row['actors_list']:
+        if a in actor_map:
+            f.hasActor.append(actor_map[a])
+    for d in row['directors_list']:
+        if d in director_map:
+            f.hasDirector.append(director_map[d])
+    film_map[title_id] = f
+
+print("KB created: films:", len(film_map), "actors:", len(actor_map), "directors:", len(director_map))
+onto_path = "/kaggle/working/movielab.owl"
+onto.save(file=onto_path, format="rdfxml")
+print("Ontology saved to:", onto_path)
+
+print("\n--- Visualizzazione di un esempio di Grafo di Conoscenza con NetworkX ---")
+
+# Crea un grafo NetworkX
+G = nx.Graph()
+
+# Aggiungi nodi e archi dal tuo KB OWL (per un esempio, limitiamo il numero di film)
+films_to_plot = list(film_map.values())[:10]  # Visualizza solo i primi 10 film per leggibilità
+
+film_nodes = [f.name for f in films_to_plot]
+actor_nodes = set()
+director_nodes = set()
+
+for film in films_to_plot:
+    # Aggiungi il nodo del film
+    G.add_node(film.name, type='film', rating=film.hasRating)
+    
+    # Aggiungi nodi attori e archi
+    for actor in film.hasActor:
+        actor_name = actor.name.replace("_", " ")
+        G.add_node(actor_name, type='actor')
+        G.add_edge(film.name, actor_name, relation='hasActor')
+        actor_nodes.add(actor_name)
+    
+    # Aggiungi nodi registi e archi
+    for director in film.hasDirector:
+        director_name = director.name.replace("_", " ")
+        G.add_node(director_name, type='director')
+        G.add_edge(film.name, director_name, relation='hasDirector')
+        director_nodes.add(director_name)
+
+print("Grafo creato. Nodi:", G.number_of_nodes(), "Archi:", G.number_of_edges())
+
+# Definizione delle proprietà di visualizzazione
+pos = nx.spring_layout(G, k=0.5, iterations=50, seed=42)  # Layout per i nodi
+node_colors = []
+node_sizes = []
+labels = {}
+
+for node, data in G.nodes(data=True):
+    node_type = data.get('type')
+    if node_type == 'film':
+        node_colors.append('skyblue')
+        node_sizes.append(100)  # Nodi più piccoli per i film
+        labels[node] = node
+    elif node_type == 'actor':
+        node_colors.append('salmon')
+        node_sizes.append(200)  # Nodi più grandi per attori
+        labels[node] = node
+    elif node_type == 'director':
+        node_colors.append('lightgreen')
+        node_sizes.append(250)  # Nodi più grandi per registi
+        labels[node] = node
+
+# Disegno del grafo
+plt.figure(figsize=(15, 15))
+nx.draw(G, pos,
+        node_color=node_colors,
+        node_size=node_sizes,
+        labels=labels,
+        font_size=8,
+        font_weight='bold',
+        with_labels=True)
+plt.title("Grafo di Conoscenza (Esempio)")
+
+# Aggiunta della legenda
+from matplotlib.lines import Line2D
+legend_elements = [Line2D([0], [0], marker='o', color='w', label='Film',
+                          markerfacecolor='skyblue', markersize=10),
+                   Line2D([0], [0], marker='o', color='w', label='Attore',
+                          markerfacecolor='salmon', markersize=10),
+                   Line2D([0], [0], marker='o', color='w', label='Regista',
+                          markerfacecolor='lightgreen', markersize=10)]
+plt.legend(handles=legend_elements, loc='upper right', title="Legenda")
+
+plt.show()
+
+# -------------------------
+# 7) Materialize derived KB facts (specializations / winners)
+# -------------------------
+GENRE_KEY = 'listed_in'
+def top_genre_for_person(name, person_type='actor'):
+    if person_type == 'actor':
+        rows = merged[merged['actors_list'].apply(lambda L: name in L if isinstance(L, list) else False)]
+    else:
+        rows = merged[merged['directors_list'].apply(lambda L: name in L if isinstance(L, list) else False)]
+    dfg = rows.copy()
+    dfg['genre'] = dfg[GENRE_KEY].fillna('').apply(lambda s: [g.strip() for g in s.split(',')] if s else [])
+    dfg = dfg.explode('genre')
+    dfg = dfg.dropna(subset=['genre'])
+    if dfg.shape[0] == 0:
+        return {}
+    stats = dfg.groupby('genre')['imdb_score'].agg(['mean','count']).reset_index()
+    return {r['genre']:(r['mean'], int(r['count'])) for _, r in stats.iterrows()}
+
+example_actor = next(iter(frequent_actors)) if len(frequent_actors)>0 else None
+if example_actor:
+    print("Sample actor genre stats:", example_actor, top_genre_for_person(example_actor, 'actor'))
+
+# -------------------------
+# 8) Feature engineering (KB-driven features)
+# -------------------------
+dir_mean_map = dict(zip(director_stats['director_single'], director_stats['dir_mean']))
+actor_mean_map = dict(zip(actor_stats['actor'], actor_stats['actor_mean']))
+
+genre_rows = merged.explode('genre_list').dropna(subset=['genre_list'])
+genre_pop = genre_rows.groupby('genre_list')['imdb_score'].agg(['mean','count']).reset_index()
+genre_pop_map = dict(zip(genre_pop['genre_list'], genre_pop['mean']))
+
+feat_rows = []
+for idx, row in merged.iterrows():
+    features = {}
+    features['title'] = row['title']
+    features['year'] = row['year'] if not pd.isna(row['year']) else 0
+    
+    # Valori di default
+    features['director_mean'] = np.nan
+    features['actor_mean_avg'] = np.nan
+    features['team_mean'] = np.nan
+    features['director_combined_mean_avg'] = np.nan 
+    features['actor_combined_mean_avg'] = np.nan
+
+    dirs = row['directors_list']
+    acts = row['actors_list']
+    genres = row['genre_list']
+
+    # Calcolo delle medie per i registi (general)
+    d_means = [dir_mean_map[d] for d in dirs if d in dir_mean_map]
+    if len(d_means)>0:
+        features['director_mean'] = np.mean(d_means)
+    
+    # Calcolo delle medie per gli attori (general)
+    acts_filtered = [a for a in acts if a in actor_mean_map]
+    features['num_frequent_actors'] = len(acts_filtered)
+    if len(acts_filtered)>0:
+        features['actor_mean_avg'] = np.mean([actor_mean_map[a] for a in acts_filtered])
+
+    # Calcolo delle medie per le coppie
+    pair_means = []
+    for d in dirs:
+        for a in acts:
+            key = ((d,a))
+            if ((team_stats['director'] == d) & (team_stats['actor'] == a)).any():
+                pm = team_stats[(team_stats['director'] == d) & (team_stats['actor'] == a)]['pair_mean'].values[0]
+                pair_means.append(pm)
+    if len(pair_means)>0:
+        features['team_mean'] = np.mean(pair_means)
+
+    d_combined_means = []
+    for d in dirs:
+        dir_gen_mean = np.nan
+        dir_gen_count = 0
+        for g in genres:
+            if (d, g) in director_genre_map:
+                dir_gen_mean, dir_gen_count = director_genre_map[(d, g)]
+                break 
+        
+        general_mean = dir_mean_map.get(d, np.nan)
+        
+        if pd.notna(dir_gen_mean) and pd.notna(general_mean) and dir_gen_count > 0:
+            weight_genre = 0.7 if dir_gen_count >= 5 else 0.4
+            combined_mean = (dir_gen_mean * weight_genre) + (general_mean * (1 - weight_genre))
+            d_combined_means.append(combined_mean)
+        elif pd.notna(general_mean):
+            d_combined_means.append(general_mean)
+            
+    if len(d_combined_means)>0:
+        features['director_combined_mean_avg'] = np.mean(d_combined_means)
+
+    a_combined_means = []
+    for a in acts_filtered:
+        act_gen_mean = np.nan
+        act_gen_count = 0
+        for g in genres:
+            if (a, g) in actor_genre_map:
+                act_gen_mean, act_gen_count = actor_genre_map[(a, g)]
+                break
+                
+        general_mean = actor_mean_map.get(a, np.nan)
+        
+        if pd.notna(act_gen_mean) and pd.notna(general_mean) and act_gen_count > 0:
+            weight_genre = 0.7 if act_gen_count >= 5 else 0.4
+            combined_mean = (act_gen_mean * weight_genre) + (general_mean * (1 - weight_genre))
+            a_combined_means.append(combined_mean)
+        elif pd.notna(general_mean):
+            a_combined_means.append(general_mean)
+
+    if len(a_combined_means)>0:
+        features['actor_combined_mean_avg'] = np.mean(a_combined_means)
+    
+    features['primary_genre'] = genres[0] if isinstance(genres, list) and len(genres)>0 else None
+    features['primary_genre_pop'] = genre_pop_map.get(features['primary_genre'], np.nan)
+    features['imdb_score'] = row['imdb_score']
+    features['imdb_votes'] = row['imdb_votes'] if 'imdb_votes' in row and pd.notna(row['imdb_votes']) else np.nan
+    features['duration'] = row['duration'] if 'duration' in row and pd.notna(row['duration']) else np.nan
+    feat_rows.append(features)
+
+feat_df = pd.DataFrame(feat_rows)
+print("Feature df shape:", feat_df.shape)
+display(feat_df.head(5))
+
+# -------------------------
+# 9) Prepare ML dataset: fill NaNs, encode categorical genre, clean duration
+# -------------------------
+ml = feat_df.copy()
+
+# Pulizia e conversione della colonna 'duration'
+if 'duration' in ml.columns:
+    ml['duration'] = ml['duration'].astype(str).str.replace(' min', '').str.replace('h', '').str.replace('s', '')
+    def parse_duration(s):
+        s = str(s).strip()
+        if not s or s == 'nan':
+            return np.nan
+        parts = s.split()
+        if len(parts) == 2 and 'h' in parts[1]:
+            return float(parts[0]) * 60
+        elif len(parts) == 4 and 'h' in parts[1] and 'min' in parts[3]:
+            return float(parts[0]) * 60 + float(parts[2])
+        try:
+            return float(s)
+        except ValueError:
+            return np.nan
+    ml['duration'] = ml['duration'].apply(parse_duration)
+
+# Aggiungi una nuova colonna indicatore di voto mancante
+ml['imdb_votes_missing'] = ml['imdb_votes'].isnull().astype(int)
+
+num_cols = ['director_mean','actor_mean_avg','team_mean','primary_genre_pop','year','imdb_votes','duration',
+            'director_combined_mean_avg', 'actor_combined_mean_avg']
+imp = SimpleImputer(strategy='median')
+ml[num_cols] = imp.fit_transform(ml[num_cols])
+
+all_genres = [g for sublist in merged['genre_list'] for g in sublist]
+genre_counts = pd.Series(all_genres).value_counts()
+top_genres = genre_counts[genre_counts > 50].index.tolist()
+
+for genre in top_genres:
+    ml[f'genre_{genre}'] = merged['genre_list'].apply(lambda x: 1 if genre in x else 0)
+
+# Ora X include la nuova colonna 'imdb_votes_missing'
+X = ml[['director_mean','actor_mean_avg','team_mean','num_frequent_actors','primary_genre_pop','year','imdb_votes','duration',
+         'director_combined_mean_avg', 'actor_combined_mean_avg',
+         'imdb_votes_missing'] + [f'genre_{g}' for g in top_genres]]
+y = ml['imdb_score']
+
+print("Final X shape:", X.shape)
+print("Distribuzione del nuovo target per la regressione:")
+print(y.describe())
+
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.2, random_state=42
+)
+print("X_train shape:", X_train.shape, "X_test shape:", X_test.shape)
+
+# -------------------------
+# 10) Regressione con Stacked Ensemble Model
+# -------------------------
+print("\n--- Inizio Regressione con Stacked Ensemble Model ---")
+
+# Definizione dei modelli di base (Level 0) con parametri ottimizzati
+estimators = [
+    ('xgb', XGBRegressor(objective='reg:squarederror', random_state=42,
+                         n_estimators=100, max_depth=3, learning_rate=0.1)),
+    ('rf', RandomForestRegressor(n_estimators=100, max_depth=5, random_state=42)),
+    ('ridge', Ridge(random_state=42))
+]
+
+# Definizione del meta-modello (Level 1)
+final_estimator = LinearRegression()
+
+# Creazione del modello di stacking
+stacked_regressor = StackingRegressor(
+    estimators=estimators,
+    final_estimator=final_estimator,
+    cv=5, 
+    n_jobs=-1
+)
+
+# Addestramento sul dataset di training
+stacked_regressor.fit(X_train, y_train)
+
+# Predizioni sul dataset di test
+y_pred = stacked_regressor.predict(X_test)
+
+print("Stacked Ensemble addestrato e predizioni generate.")
+
+# -------------------------
+# 11) Valutazione delle prestazioni di Regressione (con tutti i grafici)
+# -------------------------
+
+print("\n--- Valutazione del Modello di Regressione (Stacked Ensemble) ---")
+
+# Metriche globali
+mae = mean_absolute_error(y_test, y_pred)
+mse = mean_squared_error(y_test, y_pred)
+rmse = np.sqrt(mse)
+
+print(f"Mean Absolute Error (MAE): {mae:.4f}")
+print(f"Mean Squared Error (MSE): {mse:.4f}")
+print(f"Root Mean Squared Error (RMSE): {rmse:.4f}")
+
+# Percentuali predizioni accettabili
+acceptable_05 = np.abs(y_test - y_pred) <= 0.5
+acceptable_07 = np.abs(y_test - y_pred) <= 0.7
+
+print(f"Percentuale predizioni differenza <= 0.5: {np.mean(acceptable_05)*100:.2f}%")
+print(f"Percentuale predizioni differenza <= 0.7: {np.mean(acceptable_07)*100:.2f}%")
+
+# Grafico predizioni vs valori reali
+plt.figure(figsize=(10,6))
+plt.scatter(y_test, y_pred, alpha=0.3)
+plt.plot([y.min(), y.max()], [y.min(), y.max()], 'k--', lw=2)
+plt.xlabel("Voti Reali")
+plt.ylabel("Voti Predetti")
+plt.title("Voti Reali vs Voti Predetti")
+plt.grid()
+plt.show()
+
+# Distribuzione degli errori
+errors = y_test - y_pred
+plt.figure(figsize=(10,6))
+plt.hist(errors, bins=50, edgecolor='black')
+plt.axvline(0, color='red', linestyle='--', label="Errore zero")
+plt.xlabel("Errore di Predizione (Reale - Predetto)")
+plt.ylabel("Frequenza")
+plt.title("Distribuzione degli Errori di Predizione")
+plt.legend()
+plt.grid()
+plt.show()
+
+# -------------------------
+# Learning curve generale dello Stacked Regressor
+# -------------------------
+train_sizes, train_scores, val_scores = learning_curve(
+    estimator=stacked_regressor,
+    X=X,
+    y=y,
+    cv=5,
+    scoring='neg_mean_squared_error',
+    n_jobs=-1,
+    train_sizes=np.linspace(0.1, 1.0, 5)
+)
+
+train_mse = -np.mean(train_scores, axis=1)
+val_mse = -np.mean(val_scores, axis=1)
+
+plt.figure(figsize=(8,6))
+plt.plot(train_sizes, train_mse, 'o-', label='Training MSE')
+plt.plot(train_sizes, val_mse, 'o-', label='Validation MSE')
+plt.xlabel("Numero di campioni di training")
+plt.ylabel("Mean Squared Error (MSE)")
+plt.title("Learning Curve - Stacked Regressor")
+plt.legend()
+plt.grid()
+plt.show()
+
+# -------------------------
+# Learning curves per singoli modelli
+# -------------------------
+models = {
+    'XGBoost': XGBRegressor(objective='reg:squarederror', random_state=42, n_estimators=100, max_depth=3, learning_rate=0.1),
+    'Random Forest': RandomForestRegressor(n_estimators=100, max_depth=5, random_state=42),
+    'Ridge': Ridge(random_state=42)
+}
+
+train_sizes = np.linspace(0.1, 1.0, 5)
+
+for name, model in models.items():
+    train_sizes_abs, train_scores, val_scores = learning_curve(
+        estimator=model,
+        X=X_train,
+        y=y_train,
+        train_sizes=train_sizes,
+        cv=5,
+        scoring='neg_mean_squared_error',
+        n_jobs=-1,
+        shuffle=True,
+        random_state=42
+    )
+
+    train_mse = -np.mean(train_scores, axis=1)
+    val_mse = -np.mean(val_scores, axis=1)
+
+    plt.figure(figsize=(8,5))
+    plt.plot(train_sizes_abs, train_mse, 'o-', label='Training MSE')
+    plt.plot(train_sizes_abs, val_mse, 'o-', label='Validation MSE')
+    plt.xlabel("Numero di campioni di training")
+    plt.ylabel("Mean Squared Error (MSE)")
+    plt.title(f"Learning Curve - {name}")
+    plt.legend()
+    plt.grid()
+    plt.show()
+
+# -------------------------
+# 12) Predizione di un nuovo film - Versione Corretta
+# -------------------------
+
+def predict_new_movie(movie_data):
+    """
+    Predice il voto IMDb di un nuovo film basandosi sulle sue caratteristiche.
+    movie_data: un dizionario contenente le informazioni del film.
+    """
+    
+    # Crea un DataFrame per il singolo film
+    new_movie_df = pd.DataFrame([movie_data])
+    
+    # Pre-elaborazione simile al dataset originale
+    if 'director' in new_movie_df.columns:
+        new_movie_df['directors_list'] = new_movie_df['director'].apply(split_people)
+    else:
+        new_movie_df['directors_list'] = [[]]
+    
+    if 'cast' in new_movie_df.columns:
+        new_movie_df['actors_list'] = new_movie_df['cast'].apply(split_people)
+    else:
+        new_movie_df['actors_list'] = [[]]
+
+    new_movie_df['genre_list'] = new_movie_df['listed_in'].fillna('').apply(
+        lambda s: [g.strip() for g in s.split(',')] if s else []
+    )
+
+    feat_rows = []
+    row = new_movie_df.iloc[0]
+    features = {}
+
+    # Calcolo delle feature, come fatto nel passo 8 del tuo script
+    dirs = row['directors_list']
+    acts = row['actors_list']
+    genres = row['genre_list']
+    
+    # Feature di base (quelle che possono essere presenti o meno)
+    features['year'] = row['year'] if 'year' in row and not pd.isna(row['year']) else np.nan
+    features['imdb_votes'] = np.nan
+    features['duration'] = row['duration'] if 'duration' in row and not pd.isna(row['duration']) else np.nan
+
+    # Calcolo delle medie per i registi (general)
+    d_means = [dir_mean_map[d] for d in dirs if d in dir_mean_map]
+    features['director_mean'] = np.mean(d_means) if d_means else np.nan
+    
+    # Calcolo delle medie per gli attori (general)
+    acts_filtered = [a for a in acts if a in actor_mean_map]
+    features['num_frequent_actors'] = len(acts_filtered)
+    features['actor_mean_avg'] = np.mean([actor_mean_map[a] for a in acts_filtered]) if acts_filtered else np.nan
+
+    # Calcolo delle medie per le coppie (se ci sono)
+    pair_means = []
+    for d in dirs:
+        for a in acts:
+            if ((team_stats['director'] == d) & (team_stats['actor'] == a)).any():
+                pm = team_stats[(team_stats['director'] == d) & (team_stats['actor'] == a)]['pair_mean'].values[0]
+                pair_means.append(pm)
+    features['team_mean'] = np.mean(pair_means) if pair_means else np.nan
+    
+    # Calcolo delle medie combinate (regista-genere e attore-genere)
+    d_combined_means = []
+    for d in dirs:
+        general_mean = dir_mean_map.get(d, np.nan)
+        dir_gen_mean = np.nan
+        dir_gen_count = 0
+        for g in genres:
+            if (d, g) in director_genre_map:
+                dir_gen_mean, dir_gen_count = director_genre_map[(d, g)]
+                break
+        
+        if pd.notna(dir_gen_mean) and pd.notna(general_mean) and dir_gen_count > 0:
+            weight_genre = 0.7 if dir_gen_count >= 5 else 0.4
+            combined_mean = (dir_gen_mean * weight_genre) + (general_mean * (1 - weight_genre))
+            d_combined_means.append(combined_mean)
+        elif pd.notna(general_mean):
+            d_combined_means.append(general_mean)
+    features['director_combined_mean_avg'] = np.mean(d_combined_means) if d_combined_means else np.nan
+    
+    a_combined_means = []
+    for a in acts_filtered:
+        general_mean = actor_mean_map.get(a, np.nan)
+        act_gen_mean = np.nan
+        act_gen_count = 0
+        for g in genres:
+            if (a, g) in actor_genre_map:
+                act_gen_mean, act_gen_count = actor_genre_map[(a, g)]
+                break
+        
+        if pd.notna(act_gen_mean) and pd.notna(general_mean) and act_gen_count > 0:
+            weight_genre = 0.7 if act_gen_count >= 5 else 0.4
+            combined_mean = (act_gen_mean * weight_genre) + (general_mean * (1 - weight_genre))
+            a_combined_means.append(combined_mean)
+        elif pd.notna(general_mean):
+            a_combined_means.append(general_mean)
+    features['actor_combined_mean_avg'] = np.mean(a_combined_means) if a_combined_means else np.nan
+    
+    # Aggiungi feature genere per one-hot encoding
+    features['primary_genre_pop'] = genre_pop_map.get(genres[0], np.nan) if genres else np.nan
+    for g in top_genres:
+        features[f'genre_{g}'] = 1 if g in genres else 0
+
+    # Aggiungi la colonna dell'indicatore di voto mancante
+    features['imdb_votes_missing'] = 1
+
+    # Prepara il DataFrame per la predizione
+    new_feat_df = pd.DataFrame([features])
+    
+    # Controlla se le feature chiave sono NaN prima dell'imputazione
+    if pd.isna(new_feat_df['director_mean'].iloc[0]) and pd.isna(new_feat_df['actor_mean_avg'].iloc[0]):
+        return "Non ci sono abbastanza informazioni sui membri del cast o del team per effettuare una predizione."
+
+    # Gestione dei NaN tramite imputazione
+    new_feat_df[num_cols] = imp.transform(new_feat_df[num_cols])
+    
+    # Costruisci la riga di input per la predizione
+    try:
+        X_new = new_feat_df[['director_mean','actor_mean_avg','team_mean','num_frequent_actors','primary_genre_pop','year','imdb_votes','duration',
+                           'director_combined_mean_avg', 'actor_combined_mean_avg',
+                           'imdb_votes_missing'] + [f'genre_{g}' for g in top_genres]]
+    except KeyError as e:
+        return "Errore: una feature richiesta non è stata trovata. Impossibile fare la predizione."
+
+    # Fai la predizione
+    predicted_score = stacked_regressor.predict(X_new)[0]
+    return predicted_score
+
+# --- Esempio di utilizzo ---
+print("\n--- Esempio di predizione di un nuovo film ---")
+
+# Caso 1: Film con dati sufficienti
+new_movie_1 = {
+    'title': 'The Next Big Thing',
+    'director': 'Mike Flanagan',
+    'cast': 'Henry Thomas, Kate Siegel',
+    'listed_in': 'Horror, Drama, Thriller',
+    'year': 2025,
+    'duration': 120
+}
+
+predicted_score_1 = predict_new_movie(new_movie_1)
+print(f"Predizione per '{new_movie_1['title']}': {predicted_score_1:.2f}")
+
+# Caso 2: Film con attori e regista sconosciuti nel dataset
+new_movie_2 = {
+    'title': 'The Unknown One',
+    'director': 'John Doe',
+    'cast': 'Jane Smith, Mark Jones',
+    'listed_in': 'Action, Sci-Fi',
+    'year': 2025,
+    'duration': 90
+}
+predicted_score_2 = predict_new_movie(new_movie_2)
+print(f"Predizione per '{new_movie_2['title']}': {predicted_score_2}")
